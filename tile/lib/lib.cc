@@ -18,7 +18,7 @@ using namespace plaidml::edsl;  // NOLINT
 namespace {
 
 lang::RunInfo Evaluate(const std::string& name, const std::vector<Tensor>& vars) {
-  Program program(name, vars, {});
+  Program program(name, vars);
   return *static_cast<const tile::lang::RunInfo*>(program.runinfo());
 }
 
@@ -50,6 +50,35 @@ Tensor DilatedConvolution2(const Tensor& I, const Tensor& K) {
   auto O = NamedTensorOutput("O", N, Lx - 2 * (LKx - 1), Ly - 3 * (LKy - 1), CO);
   TensorIndex n, x, y, kx, ky, ci, co;
   O(n, x, y, co) += I(n, x + 2 * kx, y + 3 * ky, ci) * K(kx, ky, ci, co);
+  return O;
+}
+
+Tensor MaxPool2d(const Tensor& I, std::vector<size_t> pool_size, std::vector<size_t> strides) {
+  TensorDim N, X, Y, C;
+  auto I_shape = I.shape();
+  auto ndims = I_shape.ndims() - 2;
+  if (ndims != 2) {
+    throw std::runtime_error("MaxPool2d requires exactly 2 spatial dimensions");
+  }
+  while (pool_size.size() < ndims) {
+    pool_size.push_back(2);
+  }
+  if (pool_size.size() != ndims) {
+    throw std::runtime_error("Pool window size needs as many dims as tensor spatial dims");
+  }
+  while (strides.size() < ndims) {
+    strides.push_back(pool_size[strides.size()]);
+  }
+  if (strides.size() != ndims) {
+    throw std::runtime_error("Pool strides must have as many dims as tensor spatial dims");
+  }
+  TensorIndex n("n"), x("x"), y("y"), kx("kx"), ky("ky"), c("c");
+  std::vector<TensorDim> I_dims = {N, X, Y, C};
+  I.bind_dims(I_dims);
+  auto O = NamedTensorOutput("O", N, X / strides[0], Y / strides[1], C);
+  std::vector<Constraint> constraints{kx < pool_size[0], ky < pool_size[1]};
+  O(n, x, y, c) >= I(n, strides[0] * x + kx, strides[1] * y + ky, c);
+  O.add_constraints(constraints);
   return O;
 }
 
@@ -265,6 +294,15 @@ lang::RunInfo LoadConv1d(const std::string& name,     //
   return runinfo;
 }
 
+lang::RunInfo LoadMaxPool2d(const std::string& name,    //
+                            const LogicalShape& input,  //
+                            const std::vector<size_t>& pool_size) {
+  // This is a max pool with strides == pool_size
+  auto I = Placeholder(input, "I");
+  auto runinfo = Evaluate(name, {MaxPool2d(I, pool_size, {})});
+  return runinfo;
+}
+
 lang::RunInfo LoadConv2d(const std::string& name,     //
                          const LogicalShape& input,   //
                          const LogicalShape& kernel,  //
@@ -453,6 +491,25 @@ lang::RunInfo LoadSoftmax(const std::string& name,      //
   auto N = NamedTensorOutput("N", I, 1);
   N(i, 0) += E(i, j);
   return Evaluate(name, {E / N});
+}
+
+Tensor BatchNormalization(const Tensor& I, const Tensor& M, const Tensor& V, const Tensor& G, const Tensor& B,
+                          const Tensor& E) {
+  return ((I - M) * G / sqrt(V + E)) + B;
+}
+
+lang::RunInfo LoadBatchNormalization(const std::string& name,      //
+                                     const LogicalShape& input) {  //
+  auto b1dims = input.int_dims();
+  b1dims[0] = 1;
+  auto b1 = LogicalShape(PLAIDML_DATA_FLOAT32, b1dims);
+  auto I = Placeholder(b1);
+  auto M = Placeholder(b1);
+  auto V = Placeholder(b1);
+  auto G = Placeholder(b1);
+  auto B = Placeholder(b1);
+  auto E = Placeholder(PLAIDML_DATA_FLOAT32, {});
+  return Evaluate(name, {BatchNormalization(I, M, V, G, B, E)});
 }
 
 }  // namespace lib

@@ -49,21 +49,29 @@ mlir_tblgen(
 plaidml_cc_library(
     name = "stripe",
     srcs = [
+        "affine_poly.cc",
         "analysis.cc",
+        "demo_vectorize.cc",
         "dialect.cc",
+        "jigsaw_pass.cc",
         "ops.cc",
         "ops.cc.inc",
         "ops_interfaces.cc.inc",
+        "rewrites.cc",
+        "transforms.cc",
         "types.cc",
         "util.cc",
     ],
     hdrs = [
+        "affine_poly.h",
         "analysis.h",
         "dialect.h",
         "mlir.h",
         "ops.h",
         "ops.h.inc",
         "ops_interfaces.h.inc",
+	"rewrites.h",
+        "transforms.h",
         "types.h",
         "util.h",
     ],
@@ -100,16 +108,21 @@ plaidml_cc_library(
         "//pmlc/util",
         "//tile/stripe",
         "@mlir//:IR",
+        "@mlir//:Translation",
     ],
+    alwayslink = 1,
 )
 
 plaidml_cc_library(
     name = "passes",
     srcs = [
         "padding_pass.cc",
+        "populate_tensor_ref_shape_analysis.cc",
     ],
     hdrs = [
+        "nop_pass.h",
         "padding_pass.h",
+        "populate_tensor_ref_shape_analysis.h",
     ],
     copts = COPTS,
     tags = ["llvm"],
@@ -117,6 +130,7 @@ plaidml_cc_library(
         ":stripe",
         "//tile/codegen:proto_cc",
     ],
+    alwayslink = 1,
 )
 
 plaidml_cc_test(

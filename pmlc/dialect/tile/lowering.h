@@ -2,21 +2,10 @@
 
 #pragma once
 
-#include <memory>
-
 #include "mlir/IR/Module.h"
 
-namespace pmlc {
-namespace dialect {
-namespace tile {
+namespace pmlc::dialect::tile {
 
-struct TileProgram;
-struct StripeProgram;
+mlir::OwningModuleRef LowerIntoStripe(mlir::ModuleOp module);
 
-mlir::OwningModuleRef LowerIntoStripe(  //
-    mlir::MLIRContext* context,         //
-    TileProgram* program);
-
-}  // namespace tile
-}  // namespace dialect
-}  // namespace pmlc
+}  // namespace pmlc::dialect::tile

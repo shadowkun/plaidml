@@ -5,8 +5,10 @@
 #include "llvm/Support/FormatVariadic.h"
 
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 
+#include "base/util/logging.h"
 #include "pmlc/dialect/tile/ops.h"
 
 namespace pmlc {
@@ -21,9 +23,8 @@ struct OpAsmInterface : public mlir::OpAsmDialectInterface {
   /// Get a special name to use when printing the given operation. The desired
   /// name should be streamed into 'os'.
   void getOpResultName(Operation* op, llvm::raw_ostream& os) const final {
-    if (auto const_op = llvm::dyn_cast<AffineConstantOp>(op)) {
-      auto value = const_op.value().getSExtValue();
-      os << 'c' << value;
+    if (auto constOp = llvm::dyn_cast<AffineConstantOp>(op)) {
+      os << 'c' << constOp.value().getSExtValue();
     }
   }
 };
@@ -39,11 +40,16 @@ Dialect::Dialect(mlir::MLIRContext* ctx) : mlir::Dialect(getDialectNamespace(), 
   addInterfaces<OpAsmInterface>();
 }
 
+std::string Dialect::getDialectAttrName(llvm::StringRef name) {
+  return llvm::formatv("{0}.{1}", getDialectNamespace(), name).str();
+}
+
 std::string Dialect::getCanonicalOpName(llvm::StringRef name) {
   return llvm::formatv("{0}.{1}", getDialectNamespace(), name).str();
 }
 
-void Dialect::printType(mlir::Type type, llvm::raw_ostream& os) const {
+void Dialect::printType(mlir::Type type, mlir::DialectAsmPrinter& printer) const {
+  auto& os = printer.getStream();
   if (auto t = type.dyn_cast<AffineIndexMapType>()) {
     os << "imap";
   } else if (auto t = type.dyn_cast<AffineSizeMapType>()) {
@@ -51,14 +57,27 @@ void Dialect::printType(mlir::Type type, llvm::raw_ostream& os) const {
   }
 }
 
+mlir::Type Dialect::parseType(mlir::DialectAsmParser& parser) const {
+  StringRef spec = parser.getFullSymbolSpec();
+  Location loc = parser.getEncodedSourceLoc(parser.getNameLoc());
+  if (spec == "imap") {
+    return AffineIndexMapType::get(getContext());
+  }
+  if (spec == "smap") {
+    return AffineSizeMapType::get(getContext());
+  }
+  emitError(loc, llvm::formatv("unknown tile type: '{0}'", spec));
+  return Type();
+}
+
 mlir::Operation* Dialect::materializeConstant(  //
     mlir::OpBuilder& builder,                   //
     mlir::Attribute value,                      //
     mlir::Type type,                            //
     mlir::Location loc) {
-  auto int_attr = value.dyn_cast<IntegerAttr>();
-  if (int_attr) {
-    return builder.create<AffineConstantOp>(loc, type, int_attr);
+  IVLOG(5, "tile::Dialect::materializeConstant");
+  if (auto attr = value.dyn_cast<IntegerAttr>()) {
+    return builder.create<AffineConstantOp>(loc, type, attr);
   }
   return nullptr;
 }

@@ -6,6 +6,7 @@
 #include "llvm/Support/Regex.h"
 
 #include "mlir/Support/DebugStringHelper.h"
+#include "mlir/Translation.h"
 
 #include "base/util/lookup.h"
 #include "pmlc/dialect/eltwise/ops.h"
@@ -31,7 +32,9 @@ struct BlockInfo {
 
 struct ScalarInfo {
   std::set<std::string> names;
-  size_t next = 0;
+  std::string getUniqueName(StringRef name) {  //
+    return util::getUniqueName(&names, name);
+  }
 };
 
 struct StripeDevice {
@@ -65,6 +68,7 @@ class StripeBuilder {
 
  public:
   explicit StripeBuilder(mlir::FuncOp func);
+  explicit StripeBuilder(const StripeBuilder& rhs);
   std::shared_ptr<stripe::Block> getResult() { return cur_; }
 
  private:
@@ -79,6 +83,9 @@ class StripeBuilder {
   std::string get_idx(stripe::Block* sblock, mlir::BlockArgument* affine);
   stripe::Affine build_affine(stripe::Block* sblock, Value* affine);
   stripe::Location build_location(const StripeLocation& loc, Block* mblock, stripe::Block* sblock);
+
+  // Helper to get scalar (possibly inlining constant if needed)
+  std::string get_scalar(mlir::Value*);
 
   void visit(ParallelForOp op);
   void visit(ConstraintOp op, int count);
@@ -95,9 +102,10 @@ class StripeBuilder {
 
   std::shared_ptr<stripe::Block> cur_;
   std::map<stripe::Block*, ScalarInfo> scalar_names_;
-  std::map<mlir::Block*, BlockInfo> blocks_;
   std::map<std::pair<stripe::Block*, mlir::BlockArgument*>, std::string> idxs_;
   std::map<mlir::Value*, std::string> scalars_;
+  // shared state among all StripeBuilders
+  std::shared_ptr<std::map<mlir::Block*, BlockInfo>> blocks_;
 };
 
 std::pair<FlatTensorAccess, StripeLocation> ComputeAccessAndLoc(Value* tensor) {
@@ -113,27 +121,30 @@ std::pair<FlatTensorAccess, StripeLocation> ComputeAccessAndLoc(Value* tensor) {
 
   std::vector<AffinePolynomial> access;
 
-  auto matches = llvm::SmallVector<StringRef, 4>();
+  auto matches = llvm::SmallVector<StringRef, 5>();
   for (unsigned i = 0; i < ret.base_type.getRank(); i++) {
     const auto& dim = ret.base_type.getShape()[i];
     if (dim.cls == kAddressClassIdentifier) {
       access.emplace_back(ret.access[i]);
     } else {
-      static llvm::Regex re{R"(([[:alpha:]]+)_([[:digit:]]+)_([[:digit:]]+))"};
+      static llvm::Regex re{R"(([[:alpha:]_]+)_([[:digit:]]+)(_([[:digit:]]+))?)"};
       if (re.match(dim.cls, &matches)) {
         const auto& dev_name = matches[1];
-        size_t dev_idx, unit_idx;
+        size_t dev_idx;
         matches[2].getAsInteger(10, dev_idx);
-        matches[3].getAsInteger(10, unit_idx);
         if (loc.devs.size() <= dev_idx) {
           loc.devs.resize(dev_idx + 1);
         }
         auto& dev = loc.devs.at(dev_idx);
         dev.name = dev_name;
-        if (dev.units.size() <= unit_idx) {
-          dev.units.resize(unit_idx + 1);
+        if (matches[3].size()) {
+          size_t unit_idx;
+          matches[4].getAsInteger(10, unit_idx);
+          if (dev.units.size() <= unit_idx) {
+            dev.units.resize(unit_idx + 1);
+          }
+          dev.units.at(unit_idx) = ret.access[i];
         }
-        dev.units.at(unit_idx) = ret.access[i];
       }
     }
   }
@@ -142,19 +153,32 @@ std::pair<FlatTensorAccess, StripeLocation> ComputeAccessAndLoc(Value* tensor) {
   return std::make_pair(ret, loc);
 }
 
-StripeBuilder::StripeBuilder(mlir::FuncOp func) {
+StripeBuilder::StripeBuilder(const StripeBuilder& rhs)
+    : cur_(rhs.cur_),  //
+      scalar_names_(rhs.scalar_names_),
+      idxs_(rhs.idxs_),
+      scalars_(rhs.scalars_),
+      blocks_(rhs.blocks_) {}
+
+StripeBuilder::StripeBuilder(mlir::FuncOp func) : blocks_(std::make_shared<std::map<mlir::Block*, BlockInfo>>()) {
   // Construct the block and put it in the table
   cur_ = std::make_shared<stripe::Block>();
   cur_->name = func.getName();
   auto attrs = func.getAttrOfType<DictionaryAttr>(Dialect::getStripeAttrsName());
-  add_attributes(cur_.get(), attrs.getValue());
+  if (attrs) {
+    add_attributes(cur_.get(), attrs.getValue());
+  }
   auto mblock = &func.front();
   BlockInfo blockInfo(cur_.get());
   for (size_t i = 0; i < func.getNumArguments(); i++) {
     // add refinement for each arg
     auto arg = func.getArgument(i);
     auto attrName = Dialect::getDialectAttrName("name");
-    auto name = func.getArgAttrOfType<StringAttr>(i, attrName).getValue();
+    auto nameAttr = func.getArgAttrOfType<StringAttr>(i, attrName);
+    if (!nameAttr) {
+      throw std::runtime_error("Missing expected 'name' attribute on function argument");
+    }
+    auto name = nameAttr.getValue();
     // Compute all the info about the tensor
     auto tensorInfo = ComputeAccessAndLoc(arg).first;
     // Translate allocation shape
@@ -169,30 +193,27 @@ StripeBuilder::StripeBuilder(mlir::FuncOp func) {
     cur_->refs.emplace(ref);
     blockInfo.refs[tensorInfo] = name.str();
   }
-  blocks_.emplace(mblock, blockInfo);
+  blocks_->emplace(mblock, blockInfo);
   walk_interior(mblock);
 }
 
 void StripeBuilder::add_attributes(stripe::Taggable* out, ArrayRef<NamedAttribute> attrs) {
-  for (auto kvp : attrs) {
-    llvm::StringRef name = kvp.first.strref();
+  for (const auto& [key, value] : attrs) {
+    auto name = key.strref();
     if (name.count('.')) {
       name = name.split('.').second;
     }
-    if (name == "__name") {
-      continue;
-    }
-    if (kvp.second.dyn_cast<UnitAttr>()) {
+    if (value.dyn_cast<UnitAttr>()) {
       out->set_attr(name);
-    } else if (auto attr = kvp.second.dyn_cast<BoolAttr>()) {
+    } else if (auto attr = value.dyn_cast<BoolAttr>()) {
       out->set_attr(name, attr.getValue());
-    } else if (auto attr = kvp.second.dyn_cast<IntegerAttr>()) {
+    } else if (auto attr = value.dyn_cast<IntegerAttr>()) {
       out->set_attr(name, attr.getInt());
-    } else if (auto attr = kvp.second.dyn_cast<FloatAttr>()) {
+    } else if (auto attr = value.dyn_cast<FloatAttr>()) {
       out->set_attr(name, attr.getValueAsDouble());
-    } else if (auto attr = kvp.second.dyn_cast<IntegerAttr>()) {
+    } else if (auto attr = value.dyn_cast<IntegerAttr>()) {
       out->set_attr(name, attr.getInt());
-    } else if (auto attr = kvp.second.dyn_cast<StringAttr>()) {
+    } else if (auto attr = value.dyn_cast<StringAttr>()) {
       out->set_attr(name, attr.getValue().str());
     } else {
       IVLOG(1, "Attr: " << name.str());
@@ -245,8 +266,8 @@ struct RefinementBuilder {
   // Add a refinement into a stripe block
   void addRefinement(Block* mblock, StringAttr nameAttr = StringAttr{}, DictionaryAttr attrs = DictionaryAttr{}) {
     auto ndims = tensorInfo.access.size();
-    auto it = stripeBuilder->blocks_.find(mblock);
-    if (it == stripeBuilder->blocks_.end()) {
+    auto it = stripeBuilder->blocks_->find(mblock);
+    if (it == stripeBuilder->blocks_->end()) {
       throw std::runtime_error("Missing stripe block");
     }
     auto& blockInfo = it->second;
@@ -269,9 +290,9 @@ struct RefinementBuilder {
       std::vector<stripe::Affine> access;
       for (size_t i = 0; i < ndims; i++) {
         stripe::Affine aff;
-        for (const auto& kvp : tensorInfo.access[i].terms) {
-          if (kvp.first->getOwner() == mblock) {
-            aff += stripe::Affine(stripeBuilder->get_idx(sblock, kvp.first), kvp.second);
+        for (const auto& [key, value] : tensorInfo.access[i].terms) {
+          if (key->getOwner() == mblock) {
+            aff += stripe::Affine(stripeBuilder->get_idx(sblock, key), value);
           }
         }
         access.push_back(aff);
@@ -334,7 +355,7 @@ std::string StripeBuilder::add_refinements(  //
     std::string agg_name,                    //
     bool is_special) {
   RefinementBuilder builder(this, value, dir, agg_name, is_special);
-  std::unordered_set<Block*> seen{mblock};
+  std::unordered_set<Block*> seen;
   while (true) {
     // move up the def-chain
     if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(value)) {
@@ -361,14 +382,16 @@ std::string StripeBuilder::add_refinements(  //
         }
         mblock = mblock->getParentOp()->getBlock();
       }
+      auto nameAttr = op->getAttrOfType<StringAttr>("name");
+      auto attrs = op->getAttrOfType<DictionaryAttr>(Dialect::getStripeAttrsName());
+      if (!seen.count(mblock)) {
+        builder.addRefinement(mblock, nameAttr, attrs);
+        seen.insert(mblock);
+      }
       if (auto allocOp = mlir::dyn_cast<AllocateOp>(op)) {
         builder.adjustRoot();
         break;
       } else if (auto refineOp = mlir::dyn_cast<RefineOp>(op)) {
-        auto nameAttr = refineOp.getAttrOfType<StringAttr>("name");
-        auto attrs = refineOp.getAttrOfType<DictionaryAttr>(Dialect::getStripeAttrsName());
-        builder.addRefinement(mblock, nameAttr, attrs);
-        seen.insert(mblock);
         value = refineOp.in();
       }
     }
@@ -389,9 +412,9 @@ stripe::Affine StripeBuilder::build_affine(stripe::Block* sblock, Value* base) {
   stripe::Affine ret;
   AffinePolynomial poly(base);
   ret += poly.constant;
-  for (auto& kvp : poly.terms) {
-    std::string name = get_idx(sblock, kvp.first);
-    ret += stripe::Affine(name, kvp.second);
+  for (auto& [key, value] : poly.terms) {
+    std::string name = get_idx(sblock, key);
+    ret += stripe::Affine(name, value);
   }
   return ret;
 }
@@ -402,9 +425,9 @@ stripe::Location StripeBuilder::build_location(const StripeLocation& loc, Block*
     auto sdev = stripe::Device{dev.name};
     for (const auto& unit : dev.units) {
       auto aff = stripe::Affine{unit.constant};
-      for (const auto& kvp : unit.terms) {
-        if (kvp.first->getOwner() == mblock) {
-          aff += stripe::Affine(get_idx(sblock, kvp.first), kvp.second);
+      for (const auto& [key, value] : unit.terms) {
+        if (key->getOwner() == mblock) {
+          aff += stripe::Affine(get_idx(sblock, key), value);
         }
       }
       sdev.units.emplace_back(std::move(aff));
@@ -412,6 +435,17 @@ stripe::Location StripeBuilder::build_location(const StripeLocation& loc, Block*
     ret.devs.emplace_back(sdev);
   }
   return ret;
+}
+
+std::string StripeBuilder::get_scalar(Value* val) {
+  if (auto defOp = val->getDefiningOp()) {
+    if (auto constOp = llvm::dyn_cast<eltwise::ScalarConstantOp>(defOp)) {
+      if (!scalars_.count(val)) {
+        visit(constOp);
+      }
+    }
+  }
+  return scalars_.at(val);
 }
 
 void StripeBuilder::visit(ParallelForOp op) {
@@ -433,7 +467,7 @@ void StripeBuilder::visit(ParallelForOp op) {
     int64_t range = op.ranges().getValue()[i].cast<IntegerAttr>().getInt();
     std::string idx_name = "idx";
     if (idx_names && idx_names.size() > i) {
-      if (auto str_attr = idx_names.getValue()[i].template dyn_cast<StringAttr>()) {
+      if (auto str_attr = idx_names.getValue()[i].dyn_cast<StringAttr>()) {
         idx_name = str_attr.getValue().str();
       }
     }
@@ -441,7 +475,7 @@ void StripeBuilder::visit(ParallelForOp op) {
     idxs_.emplace(std::make_pair(cur_.get(), oblock.getArgument(i)), idx_name);
     cur_->idxs.emplace_back(idx_name, range);
     if (idx_attrs && idx_attrs.size() > i) {
-      if (auto attrs = idx_attrs.getValue()[i].template dyn_cast<DictionaryAttr>()) {
+      if (auto attrs = idx_attrs.getValue()[i].dyn_cast<DictionaryAttr>()) {
         add_attributes(&cur_->idxs.back(), attrs.getValue());
       }
     }
@@ -457,7 +491,7 @@ void StripeBuilder::visit(ParallelForOp op) {
     std::tie(tensorInfo, stripeLoc) = ComputeAccessAndLoc(ret.from());
     cur_->location = build_location(stripeLoc, &oblock, cur_.get());
   }
-  blocks_.emplace(&oblock, BlockInfo(cur_.get()));
+  blocks_->emplace(&oblock, BlockInfo(cur_.get()));
   walk_interior(&oblock);
 }
 
@@ -465,14 +499,14 @@ void StripeBuilder::visit(ConstraintOp op, int count) {
   IVLOG(3, "StripeBuilder::visit(ConstraintOp)");
   if (count == 1 && op.lt_case().empty()) {
     Block* inner = &op.ge_case().front();
-    blocks_.emplace(inner, BlockInfo(nullptr));
+    blocks_->emplace(inner, BlockInfo(nullptr));
     walk_interior(inner);
     // Find the stripe block to attach the contraint to
     Block* block = inner;
-    while (blocks_.at(block).stripe == nullptr) {
+    while (blocks_->at(block).stripe == nullptr) {
       block = block->getParentOp()->getBlock();
     }
-    stripe::Block* sblock = blocks_.at(block).stripe;
+    stripe::Block* sblock = blocks_->at(block).stripe;
     sblock->constraints.insert(sblock->constraints.begin(), build_affine(sblock, op.input()));
   } else {
     throw std::runtime_error("Complex contraints not supported right now");
@@ -498,7 +532,7 @@ void StripeBuilder::visit(LoadIndexOp op) {
 void StripeBuilder::visit(StoreOp op) {
   IVLOG(3, "StripeBuilder::visit(StoreOp)");
   auto ref_name = add_refinements(op.getOperation()->getBlock(), op.into(), stripe::RefDir::Out);
-  auto from = scalars_.at(op.from());
+  auto from = get_scalar(op.from());
   cur_->stmts.push_back(std::make_shared<stripe::Store>(from, ref_name));
 }
 
@@ -506,7 +540,7 @@ void StripeBuilder::visit(AggregateOp op) {
   IVLOG(3, "StripeBuilder::visit(AggregateOp)");
   auto agg_name = util::stringifyAggregationKind(op.agg());
   auto ref_name = add_refinements(op.getOperation()->getBlock(), op.into(), stripe::RefDir::Out, agg_name);
-  auto from = scalars_.at(op.from());
+  auto from = get_scalar(op.from());
   cur_->stmts.push_back(std::make_shared<stripe::Store>(from, ref_name));
 }
 
@@ -530,13 +564,6 @@ void StripeBuilder::visit(SpecialOp specialOp) {
 void StripeBuilder::visit(util::GenericBuilder builder) {
   auto op = builder.getOperation();
   IVLOG(3, "StripeBuilder::visit> " << mlir::debugString(*op));
-  for (auto operand : op->getOperands()) {
-    if (auto defOp = operand->getDefiningOp()) {
-      if (auto constOp = llvm::dyn_cast<eltwise::ScalarConstantOp>(defOp)) {
-        visit(constOp);
-      }
-    }
-  }
   auto out_name = scalar_name(op);
   scalars_.emplace(op->getResult(0), out_name);
   auto intr = std::make_shared<stripe::Intrinsic>();
@@ -546,7 +573,7 @@ void StripeBuilder::visit(util::GenericBuilder builder) {
   }
   intr->outputs.push_back(out_name);
   for (auto operand : op->getOperands()) {
-    intr->inputs.push_back(scalars_.at(operand));
+    intr->inputs.push_back(get_scalar(operand));
   }
   cur_->stmts.push_back(intr);
 }
@@ -559,8 +586,9 @@ void StripeBuilder::visit(eltwise::CastOp castOp) {
   auto result = op->getResult(0);
   auto tensorType = eltwise::getRankedTensorType(result->getType());
   auto scalarType = tensorType.getElementType().cast<eltwise::ScalarType>();
-  auto bitwidth = bit_width(scalarType.type());
-  auto bitwidth_name = scalar_name(op);
+  auto dtype = scalarType.type();
+  auto bitwidth = bit_width(dtype);
+  auto bitwidth_name = scalar_name(nullptr);
   auto constant = std::make_shared<stripe::Constant>(bitwidth_name, static_cast<int64_t>(bitwidth));
   cur_->stmts.push_back(constant);
 
@@ -568,10 +596,20 @@ void StripeBuilder::visit(eltwise::CastOp castOp) {
   auto out_name = scalar_name(op);
   scalars_.emplace(result, out_name);
   auto intr = std::make_shared<stripe::Intrinsic>();
-  intr->name = util::getOpName(op->getName());
+  if (is_float(dtype)) {
+    intr->name = "as_float";
+  } else if (is_int(dtype)) {
+    intr->name = "as_int";
+  } else if (is_uint(dtype)) {
+    intr->name = "as_uint";
+  } else if (dtype == DataType::BOOLEAN) {
+    intr->name = "as_bool";
+  } else {
+    throw std::runtime_error("Unsupported cast");
+  }
   intr->outputs.push_back(out_name);
   for (auto operand : op->getOperands()) {
-    intr->inputs.push_back(scalars_.at(operand));
+    intr->inputs.push_back(get_scalar(operand));
   }
   intr->inputs.push_back(bitwidth_name);
   cur_->stmts.push_back(intr);
@@ -604,10 +642,9 @@ void StripeBuilder::walk_interior(Block* block) {
   // Go over all the inner ops
   for (auto& op_base : *block) {
     if (auto op = mlir::dyn_cast<ParallelForOp>(op_base)) {
-      auto old_cur = cur_;
-      visit(op);
-      old_cur->stmts.push_back(cur_);
-      cur_ = old_cur;
+      StripeBuilder builder(*this);
+      builder.visit(op);
+      cur_->stmts.push_back(builder.cur_);
     } else if (auto op = mlir::dyn_cast<ConstraintOp>(op_base)) {
       visit(op, count);
     } else if (auto op = mlir::dyn_cast<LoadOp>(op_base)) {
@@ -638,19 +675,13 @@ std::string StripeBuilder::scalar_name(Operation* op, std::string out_name) {
   } else {
     out_name = "$" + out_name;
   }
-  auto attr = op->getAttr("scalar_name");
-  if (attr) {
-    auto name_attr = attr.dyn_cast<StringAttr>();
-    if (name_attr) {
-      out_name = name_attr.getValue();
+  if (op) {
+    if (auto attr = op->getAttrOfType<StringAttr>("scalar_name")) {
+      out_name = attr.getValue();
     }
   }
   auto& si = scalar_names_[cur_.get()];
-  while (si.names.count(out_name)) {
-    out_name = out_name + "_" + std::to_string(si.next++);
-  }
-  si.names.insert(out_name);
-  return out_name;
+  return si.getUniqueName(out_name);
 }
 
 }  // End namespace
@@ -676,6 +707,16 @@ std::shared_ptr<stripe::Program> FromMLIR(mlir::ModuleOp module) {
   // IVLOG(1, *ret->entry);
   return ret;
 }
+
+static mlir::LogicalResult FromMlirTranslateFunction(mlir::ModuleOp module, llvm::raw_ostream& output) {
+  auto program = FromMLIR(module);
+  std::stringstream ss;
+  ss << *program->entry;
+  output << ss.str();
+  return mlir::success();
+}
+
+static mlir::TranslateFromMLIRRegistration FromMlirTranslate("mlir-to-stripe", FromMlirTranslateFunction);
 
 }  // namespace stripe
 }  // namespace dialect

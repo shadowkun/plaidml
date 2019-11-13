@@ -5,6 +5,7 @@
 #include "mlir/IR/OpDefinition.h"
 
 #include "pmlc/dialect/eltwise/types.h"
+#include "pmlc/dialect/stripe/affine_poly.h"
 #include "pmlc/dialect/stripe/types.h"
 #include "pmlc/util/enums.h"
 
@@ -12,6 +13,7 @@ namespace pmlc {
 namespace dialect {
 namespace stripe {
 
+using eltwise::DataType;
 using eltwise::ScalarType;
 using mlir::ArrayAttr;
 using mlir::ArrayRef;
@@ -29,6 +31,7 @@ using mlir::Operation;
 using mlir::OperationState;
 using mlir::OpFoldResult;
 using mlir::OpInterface;
+using mlir::OwningRewritePatternList;
 using mlir::ParseResult;
 using mlir::RankedTensorType;
 using mlir::Region;

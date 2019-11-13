@@ -12,6 +12,7 @@ PLATFORM_COPTS = select({
     "@com_intel_plaidml//toolchain:windows_x86_64": [
         "/w",
         "/DWIN32_LEAN_AND_MEAN",
+        "/std:c++17",  # This MUST match all other compilation units
     ],
     "//conditions:default": [
         "-std=c++14",
@@ -234,6 +235,22 @@ mlir_tblgen(
     incs = ["include"],
 )
 
+mlir_tblgen(
+    name = "gen-loop-like-interface-decls",
+    src = "include/mlir/Transforms/LoopLikeInterface.td",
+    out = "include/mlir/Transforms/LoopLikeInterface.h.inc",
+    action = "-gen-op-interface-decls",
+    incs = ["include"],
+)
+
+mlir_tblgen(
+    name = "gen-loop-like-interface-defs",
+    src = "include/mlir/Transforms/LoopLikeInterface.td",
+    out = "include/mlir/Transforms/LoopLikeInterface.cpp.inc",
+    action = "-gen-op-interface-defs",
+    incs = ["include"],
+)
+
 cc_library(
     name = "StandardOps",
     srcs = glob([
@@ -263,6 +280,10 @@ cc_library(
     copts = PLATFORM_COPTS,
     includes = ["include"],
     deps = [
+        ":IR",
+        ":Parser",
+        ":StandardOps",
+        ":Support",
         "@llvm//:support",
     ],
 )
@@ -457,6 +478,7 @@ cc_library(
         ":StandardOps",
         ":gen-affine-op-decls",
         ":gen-affine-op-defs",
+        ":gen-loop-like-interface-decls",
     ],
     alwayslink = 1,
 )
@@ -482,6 +504,7 @@ cc_library(
         ":gen-infer-type-op-interface-defs",
         "@llvm//:support",
     ],
+    alwayslink = 1,
 )
 
 cc_library(
@@ -511,6 +534,7 @@ cc_library(
     includes = ["include"],
     deps = [
         ":StandardOps",
+        ":gen-loop-like-interface-decls",
         ":gen-loop-op-decls",
         ":gen-loop-op-defs",
         "@llvm//:support",
@@ -570,6 +594,8 @@ cc_library(
         ":Pass",
         ":TransformUtils",
         ":VectorOps",
+        ":gen-loop-like-interface-decls",
+        ":gen-loop-like-interface-defs",
     ],
     alwayslink = 1,
 )
@@ -666,4 +692,61 @@ cc_library(
         "@llvm//:support",
     ],
     alwayslink = 1,
+)
+
+cc_library(
+    name = "TranslateClParser",
+    srcs = ["lib/Support/TranslateClParser.cpp"],
+    hdrs = ["include/mlir/Support/TranslateClParser.h"],
+    copts = PLATFORM_COPTS,
+    includes = ["include"],
+    deps = [
+        ":Analysis",
+        ":IR",
+        ":Parser",
+        ":Support",
+        ":Translation",
+        "@llvm//:support",
+    ],
+)
+
+cc_library(
+    name = "MlirTranslateMain",
+    srcs = ["tools/mlir-translate/mlir-translate.cpp"],
+    copts = PLATFORM_COPTS,
+    deps = [
+        ":IR",
+        ":Parser",
+        ":Support",
+        ":TranslateClParser",
+        ":Translation",
+        "@llvm//:support",
+    ],
+)
+
+cc_binary(
+    name = "mlir-opt",
+    srcs = glob([
+        "tools/mlir-opt/*.cpp",
+        "tools/mlir-opt/*.h",
+    ]),
+    copts = PLATFORM_COPTS,
+    includes = ["include"],
+    linkopts = select({
+        "@com_intel_plaidml//toolchain:windows_x86_64": [],
+        "@com_intel_plaidml//toolchain:macos_x86_64": [],
+        "//conditions:default": [
+            "-pthread",
+            "-ldl",
+            "-lm",
+        ],
+    }),
+    visibility = ["//visibility:public"],
+    deps = [
+        ":Analysis",
+        ":OptMain",
+        ":Parser",
+        ":TestTransforms",
+        ":Transforms",
+    ],
 )

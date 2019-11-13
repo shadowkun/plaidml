@@ -6,9 +6,11 @@
 #include <memory>
 
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Support/DebugStringHelper.h"
 #include "mlir/Transforms/Passes.h"
 
 #include "pmlc/dialect/eltwise/util.h"
+#include "pmlc/dialect/stripe/nop_pass.h"
 #include "pmlc/dialect/stripe/padding_pass.h"
 #include "pmlc/dialect/stripe/transcode.h"
 #include "tile/codegen/compile_pass.h"
@@ -46,7 +48,8 @@ void ConvertIntoMLIR(CompilerState* state) {
   IVLOG(1, "Converting to Stripe MLIR");
   IVLOG(3, "Original\n" << *state->prog->entry);
   state->mlir->module = pmlc::dialect::stripe::IntoMLIR(&state->mlir->ctx, *state->prog);
-  IVLOG(3, "New\n" << *state->mlir->module);
+  auto module = *state->mlir->module;
+  IVLOG(3, "New\n" << mlir::debugString(module));
 }
 
 template <typename Pass, typename Config>
@@ -78,6 +81,7 @@ inline void RegisterPass() {
 }
 
 [[gnu::unused]] char register_passes = []() -> char {
+  RegisterPass<pmlc::dialect::stripe::NopPass, proto::MLIR_NopPass>();
   RegisterPass<pmlc::dialect::stripe::PaddingPass, proto::MLIR_PadPass>();
   return 0;
 }();

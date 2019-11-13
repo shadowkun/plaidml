@@ -25,9 +25,9 @@
 #include "tile/lang/runinfo.h"
 #include "tile/lib/lib.h"
 
-using namespace vertexai::tile;         // NOLINT
-using namespace pmlc::dialect::stripe;  // NOLINT
-using namespace plaidml::edsl;          // NOLINT
+using namespace vertexai::tile;         // NOLINT(build/namespaces)
+using namespace pmlc::dialect::stripe;  // NOLINT(build/namespaces)
+using namespace plaidml::edsl;          // NOLINT(build/namespaces)
 
 using ::testing::LinesEq;
 
@@ -48,9 +48,10 @@ std::unique_ptr<mlir::Pass> CreatePass(Config config) {
   return std::make_unique<Pass>(config);
 }
 
-// Stripe Classic <-> Stripe MLIR transcoding tests are parameterized by whether they should add location info
-// or not, since there've been some subtle transcoding issues when location-adding top-level refinements are
-// or aren't in place.
+// Stripe Classic <-> Stripe MLIR transcoding tests are parameterized by whether
+// they should add location info or not, since there've been some subtle
+// transcoding issues when location-adding top-level refinements are or aren't
+// in place.
 class TranscodeTest : public ::testing::TestWithParam<bool> {};
 
 static void RunTest(const lang::RunInfo& ri, bool addLocations) {
@@ -68,7 +69,6 @@ static void RunTest(const lang::RunInfo& ri, bool addLocations) {
     codegen::proto::LocateMemoryPass lmp;
     auto lmp_dev = lmp.mutable_loc()->add_devs();
     lmp_dev->set_name("OuterMem");
-    lmp_dev->add_units()->set_offset(0);
     lmp_dev = lmp.mutable_loc()->add_devs();
     lmp_dev->set_name("InnerMem");
     lmp_dev->add_units()->set_offset(1);
@@ -148,8 +148,78 @@ TEST_P(TranscodeTest, Conv2d) {
   RunTest(ri, GetParam());
 }
 
+TEST_P(TranscodeTest, MaxPool2d) {
+  using plaidml::edsl::LogicalShape;
+  LogicalShape A(PLAIDML_DATA_FLOAT32, {1, 64, 64, 3});
+  using vertexai::tile::lib::LoadMaxPool2d;
+  auto ri = LoadMaxPool2d("maxpool", A, {2, 2});
+  RunTest(ri, GetParam());
+}
+
+TEST_P(TranscodeTest, Softmax) {
+  using plaidml::edsl::LogicalShape;
+  LogicalShape A(PLAIDML_DATA_FLOAT32, {64, 64});
+  using vertexai::tile::lib::LoadSoftmax;
+  auto ri = LoadSoftmax("softmax", A);
+  RunTest(ri, GetParam());
+}
+
+TEST_P(TranscodeTest, EltwiseAdd) {
+  using plaidml::edsl::LogicalShape;
+  LogicalShape A(PLAIDML_DATA_FLOAT32, {16, 16});
+  LogicalShape B(PLAIDML_DATA_FLOAT32, {16, 16});
+  using vertexai::tile::lib::LoadEltwiseAdd;
+  auto ri = LoadEltwiseAdd("eltwise_add", A, B);
+  RunTest(ri, GetParam());
+}
+
+TEST_P(TranscodeTest, EltwiseMul) {
+  using plaidml::edsl::LogicalShape;
+  LogicalShape A(PLAIDML_DATA_FLOAT32, {16, 16});
+  LogicalShape B(PLAIDML_DATA_FLOAT32, {16, 16});
+  using vertexai::tile::lib::LoadEltwiseMul;
+  auto ri = LoadEltwiseMul("eltwise_mul", A, B);
+  RunTest(ri, GetParam());
+}
+
+TEST_P(TranscodeTest, EltwiseDiv) {
+  using plaidml::edsl::LogicalShape;
+  LogicalShape A(PLAIDML_DATA_FLOAT32, {16, 16});
+  LogicalShape B(PLAIDML_DATA_FLOAT32, {16, 16});
+  using vertexai::tile::lib::LoadEltwiseDiv;
+  auto ri = LoadEltwiseDiv("eltwise_div", A, B);
+  RunTest(ri, GetParam());
+}
+
+TEST_P(TranscodeTest, MatMul) {
+  using plaidml::edsl::LogicalShape;
+  LogicalShape A(PLAIDML_DATA_FLOAT32, {16, 16});
+  LogicalShape B(PLAIDML_DATA_FLOAT32, {16, 16});
+  using vertexai::tile::lib::LoadMatMul;
+  auto ri = LoadMatMul("matmul", A, B);
+  RunTest(ri, GetParam());
+}
+
+// These two tests fail with invalid tensor dimensions if the location parameter for RunTest is set to 0.
+
+TEST_P(TranscodeTest, LayerNorm4dAx2) {
+  using plaidml::edsl::LogicalShape;
+  LogicalShape A(PLAIDML_DATA_FLOAT32, {1, 64, 64, 32});
+  using vertexai::tile::lib::LoadLayerNorm4dAx2;
+  auto ri = LoadLayerNorm4dAx2("layer_norm", A);
+  RunTest(ri, 1);
+}
+
+TEST_P(TranscodeTest, BatchNormalization) {
+  using plaidml::edsl::LogicalShape;
+  LogicalShape A(PLAIDML_DATA_FLOAT32, {16, 64, 64, 32});
+  using vertexai::tile::lib::LoadBatchNormalization;
+  auto ri = LoadBatchNormalization("batch_norm", A);
+  RunTest(ri, 1);
+}
+
 static lang::RunInfo Evaluate(const std::string& name, const std::vector<Tensor>& vars) {
-  Program program(name, vars, {});
+  Program program(name, vars);
   return *static_cast<const lang::RunInfo*>(program.runinfo());
 }
 

@@ -12,69 +12,6 @@ namespace pmlc {
 namespace dialect {
 namespace stripe {
 
-AffinePolynomial::AffinePolynomial() : constant(0) {}
-
-AffinePolynomial::AffinePolynomial(int64_t x) : constant(x) {}
-
-AffinePolynomial::AffinePolynomial(Value* value) : constant(0) {
-  if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(value)) {
-    // This is a basic index: done
-    terms.emplace(arg, 1);
-    return;
-  }
-  auto defOp = value->getDefiningOp();
-  if (auto op = mlir::dyn_cast<AffineConstOp>(defOp)) {
-    // This is a constant
-    constant = op.value().getSExtValue();
-  } else if (auto op = mlir::dyn_cast<AffineMulOp>(defOp)) {
-    *this = AffinePolynomial(op.input());
-    *this *= op.scale().getSExtValue();
-  } else if (auto op = mlir::dyn_cast<AffineAddOp>(defOp)) {
-    for (auto operand : op.inputs()) {
-      *this += AffinePolynomial(operand);
-    }
-  } else {
-    throw std::runtime_error("Invalid affine in ComputeAffineRange");
-  }
-}
-
-AffinePolynomial& AffinePolynomial::operator*=(int64_t x) {
-  constant *= x;
-  if (x == 0) {
-    terms.clear();
-  } else {
-    for (auto& kvp : terms) {
-      kvp.second *= x;
-    }
-  }
-  return *this;
-}
-
-AffinePolynomial& AffinePolynomial::operator+=(const AffinePolynomial& x) {
-  constant += x.constant;
-  for (const auto& kvp : x.terms) {
-    terms[kvp.first] += kvp.second;
-    if (terms[kvp.first] == 0) {
-      terms.erase(kvp.first);
-    }
-  }
-  return *this;
-}
-
-bool AffinePolynomial::operator<(const AffinePolynomial& rhs) const {
-  if (constant < rhs.constant) {
-    return true;
-  }
-  if (constant > rhs.constant) {
-    return false;
-  }
-  return terms < rhs.terms;
-}
-
-bool AffinePolynomial::operator==(const AffinePolynomial& rhs) const {
-  return constant == rhs.constant && terms == rhs.terms;
-}
-
 AffineRange::AffineRange(int64_t _min, int64_t _max, uint64_t _stride) : min(_min), max(_max), stride(_stride) {
   if (min == max) {
     stride = 0;
@@ -159,6 +96,7 @@ FlatTensorAccess ComputeAccess(Value* tensor) {
     }
     auto attrName = stripe::Dialect::getDialectAttrName("layout");
     auto attr = funcOp.getArgAttrOfType<mlir::TypeAttr>(arg->getArgNumber(), attrName);
+    assert(attr && "Expected 'layout' attribute in TensorRefType function argument");
     ret.base = tensor;
     ret.base_type = attr.getValue().cast<TensorType>();
     ret.access.resize(ret.base_type.getRank());
@@ -166,6 +104,24 @@ FlatTensorAccess ComputeAccess(Value* tensor) {
     throw std::runtime_error("Invalid tensor value");
   }
   return ret;
+}
+
+bool SafeConstraintInterior(ParallelForOp op) {
+  // Get an iterator to the begining of the interior
+  auto block = &op.inner().front();
+  // Get the penultimate Op (ignoring the terminator), which should be a constraint
+  auto it_con = std::prev(block->end(), 2);
+  // Check that it's good
+  if (it_con == block->end() || !mlir::isa<ConstraintOp>(*it_con)) {
+    return false;
+  }
+  // Check that all prior ops are no-side-effect and fail if not
+  for (auto it = block->begin(); it != it_con; ++it) {
+    if (!it->hasNoSideEffect()) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace stripe

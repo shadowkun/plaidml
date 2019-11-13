@@ -3,6 +3,10 @@
 #include "pmlc/dialect/stripe/transcode.h"
 
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/MemoryBuffer.h"
+
+#include "mlir/IR/Matchers.h"
+#include "mlir/Translation.h"
 
 #include "base/util/lookup.h"
 #include "pmlc/dialect/eltwise/dialect.h"
@@ -33,19 +37,36 @@ static ScalarType DataTypeIntoMLIR(mlir::MLIRContext* ctx, DataType dtype) {  //
   return ScalarType::get(ctx, dtype);
 }
 
+static mlir::Identifier GetDevClass(MLIRContext* ctx, const stripe::Device& dev, size_t dev_idx) {
+  return mlir::Identifier::get(llvm::formatv("{0}_{1}", dev.name, dev_idx).str(), ctx);
+}
+
 static mlir::Identifier GetDevClass(MLIRContext* ctx, const stripe::Device& dev, size_t dev_idx, size_t unit_idx) {
   return mlir::Identifier::get(llvm::formatv("{0}_{1}_{2}", dev.name, dev_idx, unit_idx).str(), ctx);
 }
 
-static TensorType ShapeIntoTensorType(MLIRContext* ctx, const TensorShape& shape, const stripe::Location& loc) {
-  ScalarType dtype = DataTypeIntoMLIR(ctx, shape.type);
-  llvm::SmallVector<TensorDim, 8> dims;
+template <typename OutputIterator>
+static void LocationIntoTensorDims(MLIRContext* ctx, const stripe::Location& loc, OutputIterator out) {
+  // N.B. Locations in Stripe Classic logically reference an abstract executor space, in which size and
+  // stride are not well-specified, so we leave them undefined after translation to MLIR, and ignore
+  // them on translation back to Stripe Classic.
+
   for (size_t dev_idx = 0; dev_idx < loc.devs.size(); ++dev_idx) {
     const auto& dev = loc.devs.at(dev_idx);
-    for (size_t unit_idx = 0; unit_idx < dev.units.size(); ++unit_idx) {
-      dims.emplace_back(TensorDim{0, 0, GetDevClass(ctx, dev, dev_idx, unit_idx)});
+    if (!dev.units.size()) {
+      *out++ = TensorDim{0, 0, GetDevClass(ctx, dev, dev_idx)};
+    } else {
+      for (size_t unit_idx = 0; unit_idx < dev.units.size(); ++unit_idx) {
+        *out++ = TensorDim{0, 0, GetDevClass(ctx, dev, dev_idx, unit_idx)};
+      }
     }
   }
+}
+
+static TensorType ShapeIntoTensorType(MLIRContext* ctx, const TensorShape& shape, const stripe::Location& loc) {
+  ScalarType dtype = DataTypeIntoMLIR(ctx, shape.type);
+  auto dims = llvm::SmallVector<TensorDim, 8>{};
+  LocationIntoTensorDims(ctx, loc, std::back_inserter(dims));
   for (const auto& dim : shape.dims) {
     dims.emplace_back(
         TensorDim{static_cast<int64_t>(dim.size), dim.stride, mlir::Identifier::get(kAddressClassIdentifier, ctx)});
@@ -94,57 +115,26 @@ static DictionaryAttr TagsToDict(Builder* builder, const stripe::Taggable& tagga
 
 Value* AffineIntoMLIR(           //
     OpBuilder* builder,          //
-    Operation* constBeforeOp,    //
     const SymbolValueMap& idxs,  //
     const stripe::Affine& affine) {
   auto unknownLoc = builder->getUnknownLoc();
-  std::vector<Value*> add_inputs;
+  llvm::SmallVector<Value*, 8> vars;
+  llvm::SmallVector<int64_t, 8> coeffs;
+  int64_t offset = 0;
   for (const auto& kvp : affine.getMap()) {
-    Value* term;
     if (kvp.first.empty()) {
-      OpBuilder::InsertPoint oldInsertPoint;
-      if (constBeforeOp) {
-        oldInsertPoint = builder->saveInsertionPoint();
-        builder->setInsertionPoint(constBeforeOp);
-      }
-      term = builder->create<AffineConstOp>(  //
-          unknownLoc,                         //
-          builder->getType<AffineType>(),     //
-          builder->getI64IntegerAttr(kvp.second));
-      if (constBeforeOp) {
-        builder->restoreInsertionPoint(oldInsertPoint);
-      }
+      offset = kvp.second;
     } else {
-      term = safe_at(idxs, kvp.first);
-      if (kvp.second != 1) {
-        term = builder->createOrFold<AffineMulOp>(  //
-            unknownLoc,                             //
-            builder->getType<AffineType>(),         //
-            term,                                   //
-            builder->getI64IntegerAttr(kvp.second));
-      }
+      vars.push_back(safe_at(idxs, kvp.first));
+      coeffs.push_back(kvp.second);
     }
-    add_inputs.push_back(term);
   }
-  if (add_inputs.size() == 0) {
-    OpBuilder::InsertPoint oldInsertPoint;
-    if (constBeforeOp) {
-      oldInsertPoint = builder->saveInsertionPoint();
-      builder->setInsertionPoint(constBeforeOp);
-    }
-    auto ret = builder->create<AffineConstOp>(  //
-        unknownLoc,                             //
-        builder->getType<AffineType>(),         //
-        builder->getI64IntegerAttr(0));
-    if (constBeforeOp) {
-      builder->restoreInsertionPoint(oldInsertPoint);
-    }
-    return ret;
-  }
-  if (add_inputs.size() == 1) {
-    return add_inputs[0];
-  }
-  return builder->createOrFold<AffineAddOp>(unknownLoc, builder->getType<AffineType>(), add_inputs);
+  return builder->create<AffinePolyOp>(  //
+      unknownLoc,                        //
+      builder->getType<AffineType>(),    //
+      vars,                              //
+      builder->getI64ArrayAttr(coeffs),  //
+      builder->getI64IntegerAttr(offset));
 }
 
 static std::vector<Value*> LocationIntoTensorOffsets(OpBuilder* builder, const SymbolValueMap& idxs,
@@ -155,20 +145,65 @@ static std::vector<Value*> LocationIntoTensorOffsets(OpBuilder* builder, const S
   }
   for (size_t dev_idx = 0; dev_idx < loc.devs.size(); ++dev_idx) {
     const auto& dev = loc.devs.at(dev_idx);
-    for (size_t unit_idx = 0; unit_idx < dev.units.size(); ++unit_idx) {
-      const auto& unit = dev.units.at(unit_idx);
-      offsets.emplace_back(AffineIntoMLIR(builder, nullptr, idxs, unit));
-      if (any_non_zero_offsets && (!unit.isConstant() || unit.constant() != 0)) {
-        *any_non_zero_offsets = true;
+    if (!dev.units.size()) {
+      offsets.emplace_back(AffineIntoMLIR(builder, idxs, 0));
+    } else {
+      for (size_t unit_idx = 0; unit_idx < dev.units.size(); ++unit_idx) {
+        const auto& unit = dev.units.at(unit_idx);
+        offsets.emplace_back(AffineIntoMLIR(builder, idxs, unit));
+        if (any_non_zero_offsets && (!unit.isConstant() || unit.constant() != 0)) {
+          *any_non_zero_offsets = true;
+        }
       }
     }
   }
   return offsets;
 }
 
+using CastKey = std::pair<std::string, unsigned>;
+
+static std::map<CastKey, DataType> castMap = {
+    {std::make_pair("as_bool", 0), DataType::BOOLEAN},    //
+    {std::make_pair("as_int", 8), DataType::INT8},        //
+    {std::make_pair("as_int", 16), DataType::INT16},      //
+    {std::make_pair("as_int", 32), DataType::INT32},      //
+    {std::make_pair("as_int", 64), DataType::INT64},      //
+    {std::make_pair("as_uint", 8), DataType::UINT8},      //
+    {std::make_pair("as_uint", 16), DataType::UINT16},    //
+    {std::make_pair("as_uint", 32), DataType::UINT32},    //
+    {std::make_pair("as_uint", 64), DataType::UINT64},    //
+    {std::make_pair("as_float", 16), DataType::FLOAT16},  //
+    {std::make_pair("as_float", 32), DataType::FLOAT32},  //
+    {std::make_pair("as_float", 64), DataType::FLOAT64},  //
+};
+
 static void IntrinsicIntoMLIR(OpBuilder* builder, SymbolTable* locals, const stripe::Intrinsic& intrinsic) {
   if (intrinsic.any_tags()) {
     throw std::runtime_error("No tags allowed on intrinsics");
+  }
+  if (intrinsic.name == "as_float" ||  //
+      intrinsic.name == "as_int" ||    //
+      intrinsic.name == "as_uint" ||   //
+      intrinsic.name == "as_bool") {
+    auto bitwidth = 0;
+    if (intrinsic.name != "as_bool") {
+      auto bitwidthValue = safe_at(locals->scalars, intrinsic.inputs[1]);
+      IntegerAttr bitwidthAttr;
+      if (!m_Constant(&bitwidthAttr).match(bitwidthValue->getDefiningOp())) {
+        throw std::runtime_error("Not a constant");
+      }
+      bitwidth = bitwidthAttr.getInt();
+    }
+    auto it = castMap.find(std::make_pair(intrinsic.name, bitwidth));
+    if (it == castMap.end()) {
+      throw std::runtime_error("Unsupported cast: " + intrinsic.name);
+    }
+    auto scalarType = DataTypeIntoMLIR(builder->getContext(), it->second);
+    auto tensor = safe_at(locals->scalars, intrinsic.inputs[0]);
+    auto op = builder->create<eltwise::CastOp>(builder->getUnknownLoc(), scalarType, tensor);
+    locals->scalars.emplace(intrinsic.outputs[0], op.result());
+    op.setAttr("scalar_name", builder->getStringAttr(intrinsic.outputs[0]));
+    return;
   }
   auto opName = eltwise::Dialect::getCanonicalOpName(intrinsic.name);
   auto abstractOp = mlir::AbstractOperation::lookup(opName, builder->getContext());
@@ -262,24 +297,15 @@ static void BlockIntoMLIR(OpBuilder* builder, const SymbolTable& outer, const st
       if (idx.range != 1) {
         throw std::runtime_error("Invalid Stripe: range and affine both set on index");
       }
-      locals.idxs.emplace(idx.name, AffineIntoMLIR(builder, nullptr, outer.idxs, idx.affine));
+      locals.idxs.emplace(idx.name, AffineIntoMLIR(builder, outer.idxs, idx.affine));
     }
   }
 
   // Process the block's execution location.
   mlir::Value* executor = nullptr;
   if (!block.location.empty()) {
-    std::vector<TensorDim> dims;
-    for (size_t dev_idx = 0; dev_idx < block.location.devs.size(); ++dev_idx) {
-      const auto& dev = block.location.devs.at(dev_idx);
-      for (size_t unit_idx = 0; unit_idx < dev.units.size(); ++unit_idx) {
-        auto cls = llvm::formatv("{0}_{1}_{2}", dev.name, dev_idx, unit_idx).str();
-        // N.B. Locations in Stripe Classic logically reference an abstract executor space, in which size and
-        // stride are not well-specified, so we leave them undefined after translation to MLIR, and ignore
-        // them on translation back to Stripe Classic.
-        dims.emplace_back(TensorDim{0, 0, GetDevClass(builder->getContext(), dev, dev_idx, unit_idx)});
-      }
-    }
+    auto dims = llvm::SmallVector<TensorDim, 8>{};
+    LocationIntoTensorDims(builder->getContext(), block.location, std::back_inserter(dims));
     auto tensorType = TensorType::get(builder->getType<ExecutorType>(), dims, OffsetsMap{}, true);
     auto allocOp = builder->create<AllocateOp>(unknownLoc, tensorType);
     bool any_non_zero_offsets = false;
@@ -310,17 +336,16 @@ static void BlockIntoMLIR(OpBuilder* builder, const SymbolTable& outer, const st
       if (auto trefTy = from->getType().dyn_cast<TensorRefType>()) {
         // The outer tensor being refined may have hardware class indicies not reflected in the refinement;
         // these need to be added to the offsets in order for the RefineOp to work correctly.
-        if (static_cast<std::int64_t>(ref.access.size()) < trefTy.getRank()) {
+        if (static_cast<int64_t>(ref.access.size()) < trefTy.getRank()) {
           if (!zero) {
-            zero = builder->create<AffineConstOp>(unknownLoc, builder->getType<AffineType>(),
-                                                  builder->getI64IntegerAttr(0));
+            zero = builder->create<AffinePolyOp>(unknownLoc, AffinePolynomial());
           }
           offsets.resize(trefTy.getRank() - ref.access.size(), zero);
         }
       }
     }
     for (const auto& aff : ref.access) {
-      offsets.push_back(AffineIntoMLIR(builder, nullptr, locals.idxs, aff));
+      offsets.push_back(AffineIntoMLIR(builder, locals.idxs, aff));
     }
     auto refOp = builder->create<RefineOp>(unknownLoc, from->getType(), from, offsets);
     refOp.setAttr("name", builder->getStringAttr(ref.into()));
@@ -334,7 +359,7 @@ static void BlockIntoMLIR(OpBuilder* builder, const SymbolTable& outer, const st
   // Process the constraints
   for (const auto& con : block.constraints) {
     // Make the actual constraint value
-    auto aif = builder->create<ConstraintOp>(unknownLoc, AffineIntoMLIR(builder, nullptr, locals.idxs, con));
+    auto aif = builder->create<ConstraintOp>(unknownLoc, AffineIntoMLIR(builder, locals.idxs, con));
     // Make the block + attach to the region
     Block* if_body = new Block();
     aif.getOperation()->getRegion(0).push_back(if_body);
@@ -363,8 +388,8 @@ static void BlockIntoMLIR(OpBuilder* builder, const SymbolTable& outer, const st
       } break;
       case stripe::StmtKind::LoadIndex: {
         const auto& load_idx = stripe::LoadIndex::Downcast(stmt);
-        Value* from = AffineIntoMLIR(builder, nullptr, locals.idxs, load_idx->from);
-        Type idx_base = eltwise::ScalarType::get(builder->getContext(), DataType::INT32);
+        Value* from = AffineIntoMLIR(builder, locals.idxs, load_idx->from);
+        Type idx_base = ScalarType::get(builder->getContext(), DataType::INTX);
         Type idx_type = eltwise::getRankedTensorType(idx_base);
         auto op = builder->create<LoadIndexOp>(unknownLoc, idx_type, from);
         op.setAttr("scalar_name", builder->getStringAttr(load_idx->into));
@@ -402,12 +427,12 @@ static void BlockIntoMLIR(OpBuilder* builder, const SymbolTable& outer, const st
         switch (cnst->type) {
           case stripe::ConstType::Integer:
             op = builder->create<eltwise::ScalarConstantOp>(
-                unknownLoc, eltwise::ScalarType::get(builder->getContext(), DataType::INT64), cnst->iconst);
+                unknownLoc, ScalarType::get(builder->getContext(), DataType::INTX), cnst->iconst);
             op.setAttr("scalar_name", builder->getStringAttr(cnst->name));
             break;
           case stripe::ConstType::Float:
             op = builder->create<eltwise::ScalarConstantOp>(
-                unknownLoc, eltwise::ScalarType::get(builder->getContext(), DataType::FLOAT64), cnst->fconst);
+                unknownLoc, ScalarType::get(builder->getContext(), DataType::FLOATX), cnst->fconst);
             op.setAttr("scalar_name", builder->getStringAttr(cnst->name));
             break;
         }
@@ -479,7 +504,7 @@ static mlir::FuncOp ProgramIntoMLIR(MLIRContext* ctx, const stripe::Block& block
     // refinement locations shouldn't be dependent on any external indicies.
     auto offsets = LocationIntoTensorOffsets(&builder, initial.idxs, ref.location, &any_non_zero_offsets);
     if (any_non_zero_offsets) {
-      auto zero = builder.create<AffineConstOp>(loc, builder.getType<AffineType>(), builder.getI64IntegerAttr(0));
+      auto zero = builder.create<AffinePolyOp>(loc, AffinePolynomial());
       offsets.resize(offsets.size() + ref.interior_shape.dims.size(), zero);
       auto refOp = builder.create<RefineOp>(loc, arg->getType(), arg, offsets);
       initial.refs.emplace(ref.into(), refOp);
@@ -490,7 +515,7 @@ static mlir::FuncOp ProgramIntoMLIR(MLIRContext* ctx, const stripe::Block& block
     auto attrName = Dialect::getDialectAttrName("name");
     func.setArgAttr(argIndex, attrName, builder.getStringAttr(ref.into()));
     auto attrLayout = Dialect::getDialectAttrName("layout");
-    func.setArgAttr(argIndex, attrLayout, builder.getTypeAttr(tensorTypes[argIndex]));
+    func.setArgAttr(argIndex, attrLayout, TypeAttr::get(tensorTypes[argIndex]));
   }
 
   auto attrs = TagsToDict(&builder, block);
@@ -509,6 +534,19 @@ mlir::OwningModuleRef IntoMLIR(MLIRContext* ctx, const stripe::Program& prog) {
   module.push_back(func);
   return module;
 }
+
+static mlir::OwningModuleRef IntoMlirTranslateFunction(  //
+    std::unique_ptr<llvm::MemoryBuffer> input,           //
+    MLIRContext* context) {
+  vertexai::tile::stripe::proto::Program proto;
+  if (!stripe::FromProtoText(input->getBuffer().str(), &proto)) {
+    llvm::report_fatal_error("Could not parse stripe prototxt");
+    return nullptr;
+  }
+  return IntoMLIR(context, *stripe::FromProto(proto));
+}
+
+static mlir::TranslateToMLIRRegistration IntoMlirTranslate("stripe-to-mlir", IntoMlirTranslateFunction);
 
 }  // namespace stripe
 }  // namespace dialect
